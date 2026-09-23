@@ -1,0 +1,6 @@
+{
+  "name": "E-Reader Python Foundation",
+  "description": "Nền tảng ứng dụng đọc sách Python (PyQt6) với Config, Database và Logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
