@@ -193,16 +193,6 @@ class EpubParser(Document):
 
     def get_page(self, index: int) -> Page:
         if 0 <= index < len(self._chapters):
-            ch = self._chapters[index]
-            
-            # Handle virtual cover
-            if ch.get('is_virtual_cover'):
-                cover_data = self.get_cover()
-                import base64
-                b64 = base64.b64encode(cover_data).decode('utf-8')
-                html = f"<html><body style='margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh;'><img src='data:image/jpeg;base64,{b64}' style='max-width:100%;max-height:100%;object-fit:contain;' /></body></html>"
-                return Page(index=index, text="Cover Page", html=html)
-
             # Check cache first
             if self.db:
                 try:
