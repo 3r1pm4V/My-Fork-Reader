@@ -1,6 +1,5 @@
 from lxml import etree
 from pathlib import Path
-from typing import List, Tuple, Optional
 from ereader.formats.base import Document, TOCItem, Page, UnsupportedFormatError
 
 
@@ -11,7 +10,7 @@ class Fb2Parser(Document):
 
     def __init__(self, path: Path):
         super().__init__(path)
-        self._tree: Optional[etree._ElementTree] = None
+        self._tree: etree._ElementTree | None = None
         self._ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
         self._load()
 
@@ -27,11 +26,15 @@ class Fb2Parser(Document):
 
     @property
     def title(self) -> str:
+        if self._tree is None:
+            return self.path.stem
         title_node = self._tree.find('.//fb:book-title', namespaces=self._ns)
         return title_node.text if title_node is not None else self.path.stem
 
     @property
     def author(self) -> str:
+        if self._tree is None:
+            return "Unknown"
         author_node = self._tree.find('.//fb:author', namespaces=self._ns)
         if author_node is not None:
             first = author_node.find('fb:first-name', namespaces=self._ns)
@@ -44,7 +47,9 @@ class Fb2Parser(Document):
         return "FB2"
 
     @property
-    def toc(self) -> List[TOCItem]:
+    def toc(self) -> list[TOCItem]:
+        if self._tree is None:
+            return []
         toc = []
         sections = self._tree.findall('.//fb:section', namespaces=self._ns)
         for i, section in enumerate(sections):
@@ -57,10 +62,14 @@ class Fb2Parser(Document):
 
     @property
     def total_pages(self) -> int:
+        if self._tree is None:
+            return 0
         sections = self._tree.findall('.//fb:section', namespaces=self._ns)
         return len(sections) if sections else 1
 
     def get_page(self, index: int) -> Page:
+        if self._tree is None:
+            raise IndexError("Document not loaded")
         sections = self._tree.findall('.//fb:section', namespaces=self._ns)
         if 0 <= index < len(sections):
             section = sections[index]
@@ -71,12 +80,16 @@ class Fb2Parser(Document):
         raise IndexError("Section index out of range")
 
     def get_html(self) -> str:
+        if self._tree is None:
+            return "<html><body>No content loaded</body></html>"
         body = self._tree.find('.//fb:body', namespaces=self._ns)
         if body is not None:
             return f"<html><body>{etree.tostring(body, encoding='unicode', method='html')}</body></html>"
         return "<html><body>No content found</body></html>"
 
-    def search(self, query: str) -> List[Tuple[int, str]]:
+    def search(self, query: str) -> list[tuple[int, str]]:
+        if self._tree is None:
+            return []
         results = []
         query = query.lower()
         sections = self._tree.findall('.//fb:section', namespaces=self._ns)
@@ -87,10 +100,3 @@ class Fb2Parser(Document):
                 snippet = text[max(0, idx-30):idx+70]
                 results.append((i, f"...{snippet}..."))
         return results
-
-
-# TODO / EXTENSION POINTS:
-# 1. Full XSLT transformation for professional rendering.
-# 2. Extraction of binary images stored in FB2.
-# 3. Support for footnotes and comments as popups.
-# 4. Handle nested sections for deeper TOC hierarchy.

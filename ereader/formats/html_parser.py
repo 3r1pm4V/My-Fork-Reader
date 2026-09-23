@@ -1,6 +1,5 @@
 from bs4 import BeautifulSoup
 from pathlib import Path
-from typing import List, Tuple, Optional
 from ereader.formats.base import Document, TOCItem, Page, UnsupportedFormatError
 
 
@@ -12,7 +11,7 @@ class HtmlParser(Document):
 
     def __init__(self, path: Path):
         super().__init__(path)
-        self._soup: Optional[BeautifulSoup] = None
+        self._soup: BeautifulSoup | None = None
         self._clean_html: str = ""
         self._text: str = ""
         self._load()
@@ -33,12 +32,14 @@ class HtmlParser(Document):
 
     @property
     def title(self) -> str:
-        if self._soup.title:
+        if self._soup and self._soup.title:
             return self._soup.title.string
         return self.path.stem
 
     @property
     def author(self) -> str:
+        if not self._soup:
+            return "Unknown"
         # Try to find meta author
         author_meta = self._soup.find("meta", attrs={"name": "author"})
         if author_meta:
@@ -50,7 +51,9 @@ class HtmlParser(Document):
         return "HTML"
 
     @property
-    def toc(self) -> List[TOCItem]:
+    def toc(self) -> list[TOCItem]:
+        if not self._soup:
+            return []
         # Generate TOC from H1-H3 tags
         toc = []
         headers = self._soup.find_all(['h1', 'h2', 'h3'])
@@ -71,7 +74,7 @@ class HtmlParser(Document):
     def get_html(self) -> str:
         return self._clean_html
 
-    def search(self, query: str) -> List[Tuple[int, str]]:
+    def search(self, query: str) -> list[tuple[int, str]]:
         results = []
         query = query.lower()
         if query in self._text.lower():
@@ -79,9 +82,3 @@ class HtmlParser(Document):
             snippet = self._text[max(0, idx-30):idx+70]
             results.append((0, f"...{snippet}..."))
         return results
-
-
-# TODO / EXTENSION POINTS:
-# 1. Implement advanced article extraction (readability-like) to remove clutter.
-# 2. Support for external assets (images, CSS) via absolute path mapping.
-# 3. Intelligent splitting of very long HTML files into pages.

@@ -1,7 +1,6 @@
-import chardet
 from pathlib import Path
-from typing import List, Tuple, Optional
 from ereader.formats.base import Document, TOCItem, Page, UnsupportedFormatError
+import chardet
 
 
 class TxtParser(Document):
@@ -15,15 +14,26 @@ class TxtParser(Document):
         self.chars_per_page = chars_per_page
         self._content: str = ""
         self._encoding: str = "utf-8"
-        self._pages: List[str] = []
+        self._pages: list[str] = []
         self._load()
 
     def _load(self):
         try:
             raw_data = self.path.read_bytes()
-            detection = chardet.detect(raw_data)
-            self._encoding = detection['encoding'] or 'utf-8'
-            self._content = raw_data.decode(self._encoding, errors='replace')
+            
+            # 1. Try UTF-8 first
+            try:
+                self._content = raw_data.decode('utf-8')
+                self._encoding = 'utf-8'
+            except UnicodeDecodeError:
+                # 2. Use chardet with confidence threshold
+                detection = chardet.detect(raw_data)
+                if detection['confidence'] > 0.6:
+                    self._encoding = detection['encoding'] or 'latin-1'
+                else:
+                    self._encoding = 'latin-1'
+                
+                self._content = raw_data.decode(self._encoding, errors='replace')
             
             # Simple pagination by character count
             self._pages = [
@@ -46,9 +56,8 @@ class TxtParser(Document):
         return "TXT"
 
     @property
-    def toc(self) -> List[TOCItem]:
+    def toc(self) -> list[TOCItem]:
         # TXT files usually don't have a TOC.
-        # Extension point: Could detect headers like "Chapter 1"
         return []
 
     @property
@@ -67,7 +76,7 @@ class TxtParser(Document):
         body = "".join(f"<p>{line}</p>" for line in self._content.splitlines() if line.strip())
         return f"<html><body>{body}</body></html>"
 
-    def search(self, query: str) -> List[Tuple[int, str]]:
+    def search(self, query: str) -> list[tuple[int, str]]:
         results = []
         query = query.lower()
         for i, page_text in enumerate(self._pages):
@@ -76,10 +85,3 @@ class TxtParser(Document):
                 snippet = page_text[start:start + 100].replace("\n", " ")
                 results.append((i, f"...{snippet}..."))
         return results
-
-
-# TODO / EXTENSION POINTS:
-# 1. Regex-based chapter detection for TOC generation.
-# 2. Intelligent paging that doesn't break words or sentences.
-# 3. Support for markdown-like formatting detection.
-# 4. Handle very large files using memory mapping (mmap).

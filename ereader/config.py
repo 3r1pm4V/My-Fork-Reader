@@ -1,125 +1,141 @@
 import os
 import yaml
-from dataclasses import dataclass, field, asdict
+import logging
 from pathlib import Path
-from typing import Optional
+from dataclasses import dataclass, field, asdict
 
+def get_app_dir() -> Path:
+    """Returns the platform-specific application data directory."""
+    if os.name == 'nt':
+        # On Windows: %APPDATA%/ereader
+        app_dir = Path(os.getenv('APPDATA', os.path.expanduser('~'))) / "ereader"
+    else:
+        app_dir = Path.home() / ".config" / "ereader"
+    
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
 
 @dataclass
 class ReadingConfig:
-    font_family: str = "Arial"
-    font_size: int = 12
-    line_height: float = 1.5
-    theme: str = "light"  # light, dark, sepia
-
+    font_size: int = 18
+    line_height: float = 1.6
+    theme: str = "light"
+    font_family: str = "Literata"
 
 @dataclass
 class LibraryConfig:
-    path: str = str(Path.home() / "Documents" / "E-Reader")
+    path: str = str(get_app_dir() / "library")
+    folders: list[str] = field(default_factory=list)
+    view_mode: str = "grid"
+    sort_by: str = "added_at"
     auto_scan: bool = True
 
+@dataclass
+class CacheConfig:
+    enabled: bool = True
+    max_size_mb: int = 500
+    clear_on_startup: bool = False
 
 @dataclass
 class TTSConfig:
-    enabled: bool = False
-    rate: int = 150
+    rate: int = 200
     volume: float = 1.0
-
+    voice_id: str | None = None
 
 @dataclass
 class SyncConfig:
     enabled: bool = False
-    provider: str = "none"  # google_drive, dropbox
-
+    url: str = "https://sync.koreader.rocks"
+    username: str = ""
+    password: str = ""
+    device_id: str = "default_device"
 
 @dataclass
-class WindowConfig:
-    width: int = 1024
-    height: int = 768
-    maximized: bool = False
-
+class UIConfig:
+    skeleton_enabled: bool = True
+    skeleton_animation: bool = True
+    fade_duration_ms: int = 300
 
 @dataclass
 class LoggingConfig:
     level: str = "INFO"
     file_log: bool = True
 
+@dataclass
+class WindowConfig:
+    width: int = 1200
+    height: int = 800
+    maximized: bool = False
 
 @dataclass
 class Config:
     reading: ReadingConfig = field(default_factory=ReadingConfig)
     library: LibraryConfig = field(default_factory=LibraryConfig)
+    window: WindowConfig = field(default_factory=WindowConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
-    window: WindowConfig = field(default_factory=WindowConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
+    def save(self):
+        """Instance method for convenience, calls global save_config."""
+        save_config(self)
 
-def get_default_config_path() -> Path:
-    """Returns the default config path based on OS standards (APPDATA on Windows)."""
-    if os.name == 'nt':
-        base_path = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
-    else:
-        base_path = Path.home() / ".config"
-    
-    return base_path / "ereader" / "config.yaml"
+    @classmethod
+    def load(cls) -> 'Config':
+        """Class method for convenience, calls global load_config."""
+        return load_config()
 
-
-def load_config(path: Optional[Path] = None) -> Config:
-    """
-    Loads config from a YAML file. Creates a default one if it doesn't exist.
-    
-    Args:
-        path: Optional Path to the config file.
-        
-    Returns:
-        Config: The loaded or default configuration.
-    """
+def load_config(path: Path | str | None = None) -> Config:
+    """Loads configuration from a YAML file."""
     if path is None:
-        path = get_default_config_path()
-
+        path = get_app_dir() / "config.yaml"
+    else:
+        path = Path(path)
+        
     if not path.exists():
-        cfg = Config()
-        save_config(cfg, path)
-        return cfg
-
+        return Config()
+        
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             
-            # Simple manual mapping to handle dataclass nesting
+            def from_dict(cls, d):
+                if not d: return cls()
+                return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
             return Config(
-                reading=ReadingConfig(**data.get('reading', {})),
-                library=LibraryConfig(**data.get('library', {})),
-                tts=TTSConfig(**data.get('tts', {})),
-                sync=SyncConfig(**data.get('sync', {})),
-                window=WindowConfig(**data.get('window', {})),
-                logging=LoggingConfig(**data.get('logging', {}))
+                reading=from_dict(ReadingConfig, data.get('reading')),
+                library=from_dict(LibraryConfig, data.get('library')),
+                window=from_dict(WindowConfig, data.get('window')),
+                cache=from_dict(CacheConfig, data.get('cache')),
+                tts=from_dict(TTSConfig, data.get('tts')),
+                sync=from_dict(SyncConfig, data.get('sync')),
+                ui=from_dict(UIConfig, data.get('ui')),
+                logging=from_dict(LoggingConfig, data.get('logging'))
             )
     except Exception as e:
-        print(f"Error loading config: {e}. Using defaults.")
+        logging.error(f"Failed to load config from {path}: {e}")
         return Config()
 
-
-def save_config(cfg: Config, path: Optional[Path] = None):
-    """
-    Saves the config object to a YAML file.
-    
-    Args:
-        cfg: The Config object to save.
-        path: Optional Path to the config file.
-    """
+def save_config(config: Config, path: Path | str | None = None):
+    """Saves configuration to a YAML file."""
     if path is None:
-        path = get_default_config_path()
+        path = get_app_dir() / "config.yaml"
+    else:
+        path = Path(path)
+        
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(asdict(config), f, default_flow_style=False)
+    except Exception as e:
+        logging.error(f"Failed to save config to {path}: {e}")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(path, 'w', encoding='utf-8') as f:
-        yaml.dump(asdict(cfg), f, default_flow_style=False, allow_unicode=True)
+CONFIG_PATH = get_app_dir() / "config.yaml"
 
-
-# TODO / EXTENSION POINTS:
-# 1. Add schema validation using Cerberus or Pydantic.
-# 2. Implement config migration logic for future version updates.
-# 3. Add support for environment variable overrides.
-# 4. Implement a dynamic 'watch' feature to reload config on file change.
+__all__ = [
+    "Config", "load_config", "save_config", "get_app_dir", "CONFIG_PATH",
+    "ReadingConfig", "LibraryConfig", "WindowConfig", "CacheConfig", 
+    "TTSConfig", "SyncConfig", "UIConfig", "LoggingConfig"
+]

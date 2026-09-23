@@ -1,3 +1,6 @@
-from ereader.ui.main_window import MainWindow
-from ereader.ui.reader_view import ReaderView
-from ereader.ui.themes import apply_theme, THEMES
+"""
+UI Package for E-Reader.
+"""
+from ereader.ui.themes import apply_theme
+
+__all__ = ["apply_theme"]

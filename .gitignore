@@ -1,8 +1,21 @@
-node_modules/
-build/
-dist/
-coverage/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Project specific
+library.db
+ereader.log
+config.yaml
+covers/
+tests/.pytest_cache/
+
+# OS
 .DS_Store
-*.log
-.env*
-!.env.example
+Thumbs.db

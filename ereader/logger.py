@@ -49,13 +49,9 @@ def setup_logging(config):
             logger.addHandler(file_handler)
             logging.info(f"Logging to file initialized: {log_file}")
         except Exception as e:
-            print(f"Failed to initialize file logging: {e}")
+            # Fallback to console only if file logging fails
+            logging.error(f"Failed to initialize file logging: {e}")
 
     logging.info("Logging system ready.")
 
-
-# TODO / EXTENSION POINTS:
-# 1. Add colorized output for console logs (using 'colorama' or 'rich').
-# 2. Implement remote logging/telemetry for crash reporting (optional).
-# 3. Add structured logging (JSON format) for easier parsing.
-# 4. Create a dedicated Log Viewer widget within the app.
+__all__ = ["setup_logging"]

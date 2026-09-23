@@ -1,15 +1,22 @@
+import logging
 from pathlib import Path
-from typing import Type, Dict
-from ereader.formats.base import Document, UnsupportedFormatError
+from ereader.formats.base import (
+    Document, UnsupportedFormatError, CorruptedBookError, ParseError, BookNotFoundError
+)
 from ereader.formats.txt_parser import TxtParser
-from ereader.formats.epub_parser import EpubParser
 from ereader.formats.html_parser import HtmlParser
 from ereader.formats.fb2_parser import Fb2Parser
 from ereader.formats.mobi_parser import MobiParser
 
-PARSERS: Dict[str, Type[Document]] = {
+HAS_FAST_EBOOK = False
+try:
+    from ereader.formats.epub_parser import EpubParser
+    HAS_FAST_EBOOK = True
+except ImportError:
+    logging.warning("fast-ebook not found. EPUB support disabled.")
+
+PARSERS: dict[str, type[Document]] = {
     '.txt': TxtParser,
-    '.epub': EpubParser,
     '.html': HtmlParser,
     '.htm': HtmlParser,
     '.fb2': Fb2Parser,
@@ -18,20 +25,16 @@ PARSERS: Dict[str, Type[Document]] = {
     '.azw3': MobiParser,
 }
 
+if HAS_FAST_EBOOK:
+    PARSERS['.epub'] = EpubParser
 
-def get_parser(path: Path) -> Document:
+def get_parser(path: Path, db=None) -> Document:
     """
     Factory function to get the appropriate parser for a given file.
-    
-    Args:
-        path: Path to the book file.
-        
-    Returns:
-        Document: An instance of a Document parser.
-        
-    Raises:
-        UnsupportedFormatError: If the extension is not supported or parsing fails.
     """
+    if not path.exists():
+        raise BookNotFoundError(f"File not found: {path}")
+
     ext = path.suffix.lower()
     parser_class = PARSERS.get(ext)
     
@@ -39,14 +42,16 @@ def get_parser(path: Path) -> Document:
         raise UnsupportedFormatError(f"Extension '{ext}' is not supported.")
     
     try:
+        if ext == '.epub' and HAS_FAST_EBOOK:
+            return parser_class(path, db=db)
         return parser_class(path)
-    except Exception as e:
-        # Re-raise as UnsupportedFormatError if it's not already
-        if not isinstance(e, UnsupportedFormatError):
-            raise UnsupportedFormatError(f"Error initializing parser for {path.name}: {e}")
+    except (UnsupportedFormatError, CorruptedBookError, ParseError, BookNotFoundError):
         raise
+    except Exception as e:
+        raise UnsupportedFormatError(f"Error initializing parser for {path.name}: {e}")
 
-# TODO / EXTENSION POINTS:
-# 1. Add support for PDF (using PyMuPDF or pdfminer).
-# 2. Plugin system to allow users to add custom parsers via entry points.
-# 3. Support for compressed files (.zip, .rar containing books).
+__all__ = [
+    "get_parser", "Document", "UnsupportedFormatError", 
+    "CorruptedBookError", "ParseError", "BookNotFoundError",
+    "HAS_FAST_EBOOK"
+]
