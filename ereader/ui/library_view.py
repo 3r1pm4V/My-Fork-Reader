@@ -1,6 +1,7 @@
 from pathlib import Path
 import logging
 import collections
+from unidecode import unidecode
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
     QListView, QTableView, QAbstractItemView, QMenu, QFileDialog,
@@ -42,10 +43,16 @@ class CoverLoader(QRunnable):
             if self.is_folder:
                 pixmap = self._generate_folder_cover()
             else:
+                # Kiểm tra đường dẫn tồn tại trước khi load
+                if not Path(self.path).exists():
+                    logging.warning(f"Cover file does not exist: {self.path}")
+                    return
+                
                 image = QImage(self.path)
                 if not image.isNull():
                     pixmap = QPixmap.fromImage(image.scaled(150, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                 else:
+                    logging.warning(f"Failed to decode image: {self.path}")
                     return
             self.signals.cover_loaded.emit(self.index, pixmap)
         except Exception as e:
@@ -417,11 +424,18 @@ class LibraryView(QWidget):
             return
             
         # Global search: ignore folders, show all matches from DB
+        # Normalize search text
+        normalized_text = unidecode(text).lower()
+        
         all_books = self.db.list_books()
         self.source_model.beginResetModel()
         self.source_model.items = []
         for b in all_books:
-            if text.lower() in b['title'].lower() or text.lower() in (b['author'] or "").lower():
+            # Normalize title and author
+            title = unidecode(b['title']).lower()
+            author = unidecode(b['author'] or "").lower()
+            
+            if normalized_text in title or normalized_text in author:
                 self.source_model.items.append(LibraryItem(False, b['title'], b['file_path'], b))
         self.source_model.endResetModel()
 

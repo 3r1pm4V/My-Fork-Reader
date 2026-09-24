@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 import requests
+import hashlib
 import logging
 
 class SyncDialog(QDialog):
@@ -95,10 +96,15 @@ class SyncDialog(QDialog):
         self.status_label.setText("Testing connection...")
         self.status_label.setStyleSheet("color: blue;")
         
-        url = self.url_edit.text().rstrip('/') + "/koreader/sync/v1/auth"
+        # Same server as SyncClient: kosync auth check lives at /users/auth.
+        url = self.url_edit.text().rstrip('/') + "/users/auth"
+        # kosync expects x-auth-key to be the MD5 hex digest of the password,
+        # never the plaintext password (same rule as SyncClient._get_headers).
+        hashed_password = hashlib.md5(self.pass_edit.text().encode("utf-8")).hexdigest()
         headers = {
             "x-auth-user": self.user_edit.text(),
-            "x-auth-key": self.pass_edit.text(),
+            "x-auth-key": hashed_password,
+            "Accept": "application/vnd.koreader.v1+json",
             "User-Agent": "ereader-py/0.1.0"
         }
         

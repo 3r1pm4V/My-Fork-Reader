@@ -2,7 +2,7 @@ import logging
 import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from ereader.utils import get_file_hash
+from ereader.utils import get_file_hash, partial_md5
 from ereader.formats import get_parser, HAS_FAST_EBOOK
 from ereader.models import Book
 
@@ -54,10 +54,10 @@ def _try_get_metadata_lenient(path: Path) -> dict:
                     
                     creator_tag = soup_o.find("dc:creator")
                     if creator_tag: meta["author"] = creator_tag.get_text(strip=True)
-            except:
-                pass
+            except Exception:
+                logging.debug(f"Lenient EPUB metadata parse (container/opf) failed for {path.name}", exc_info=True)
     except Exception:
-        pass
+        logging.debug(f"Lenient EPUB metadata parse failed for {path.name}", exc_info=True)
     return meta
 
 def scan_folder(folder_path: Path, db, recursive: bool = True) -> tuple[int, int]:
@@ -79,7 +79,8 @@ def scan_folder(folder_path: Path, db, recursive: bool = True) -> tuple[int, int
     # Process all files
     for p in files:
         try:
-            book_hash = get_file_hash(p)
+            # Use KOReader-compatible MD5(Binary method) for sync ID
+            book_hash = partial_md5(p)
             existing_book = db.get_book_by_path(str(p))
             
             # Check if cover needs refresh

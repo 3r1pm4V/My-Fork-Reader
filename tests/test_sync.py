@@ -40,5 +40,38 @@ def test_sync_client_header_generation():
     headers = client._get_headers()
     
     assert headers["x-auth-user"] == "testuser"
-    assert headers["x-auth-key"] == "secretkey"
+    # kosync wants the MD5 hex digest of the password, never the plaintext
+    assert headers["x-auth-key"] == hashlib.md5(b"secretkey").hexdigest()
     assert "User-Agent" in headers
+
+
+# --- remote progress reconciliation -------------------------------------
+
+from ereader.features.sync_logic import plan_remote_jump
+
+
+def test_no_remote_no_jump():
+    assert plan_remote_jump(None, 0.3) is None
+    assert plan_remote_jump({}, 0.3) is None
+    assert plan_remote_jump({"percentage": "abc"}, 0.3) is None
+
+
+def test_within_tolerance_no_jump():
+    assert plan_remote_jump({"percentage": 0.302}, 0.300) is None
+
+
+def test_far_remote_offers_jump_by_percentage_for_koreader_xpointer():
+    remote = {"percentage": 0.5, "progress": "/body/DocFragment[3]/body/p[2]/text().0",
+              "device": "Kindle"}
+    jump = plan_remote_jump(remote, 0.0)
+    assert jump is not None
+    assert jump.percentage == 0.5
+    assert jump.cfi is None            # xpointer is not a CFI -> fall back to %
+    assert jump.device == "Kindle"
+
+
+def test_real_cfi_is_used_and_percentage_string_is_accepted():
+    remote = {"percentage": "0.75", "progress": "epubcfi(/6/8!/4/2)"}
+    jump = plan_remote_jump(remote, 0.1)
+    assert jump.cfi == "epubcfi(/6/8!/4/2)"
+    assert jump.percentage == 0.75

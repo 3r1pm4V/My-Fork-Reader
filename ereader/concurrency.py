@@ -47,17 +47,23 @@ class AsyncRunner(QObject):
         super().__init__()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        # Signalled once run_forever() has actually started, so submit()
+        # never races the thread startup (which used to silently drop the
+        # very first coroutine and log "coroutine was never awaited").
+        self._loop_ready = threading.Event()
         self._start_loop()
 
     def _start_loop(self):
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="AsyncRunnerThread")
         self._thread.start()
+        self._loop_ready.wait(timeout=5)
 
     def _run_loop(self):
         tid = threading.get_native_id()
         logging.info(f"[Thread {tid}] AsyncRunner loop started")
         asyncio.set_event_loop(self._loop)
+        self._loop.call_soon(self._loop_ready.set)
         try:
             self._loop.run_forever()
         finally:
@@ -65,9 +71,16 @@ class AsyncRunner(QObject):
         logging.info(f"[Thread {tid}] AsyncRunner loop stopped")
 
     def submit(self, coro):
-        """Submit a coroutine to the background loop."""
-        if self._loop and self._loop.is_running():
+        """Submit a coroutine to the background loop.
+
+        Returns the concurrent.futures.Future, or None if the loop isn't
+        ready/running. In the None case the coroutine is explicitly closed
+        so Python doesn't emit a 'coroutine was never awaited' warning.
+        """
+        if self._loop and self._loop_ready.is_set() and self._loop.is_running():
             return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        logging.warning("AsyncRunner.submit: event loop not ready, dropping task.")
+        coro.close()
         return None
 
     def stop(self):

@@ -50,6 +50,11 @@ def run():
     config = load_config()
     setup_logging(config)
     
+    # Ensure foliate-js assets exist
+    splash.set_progress(20, "Đang kiểm tra tài nguyên...")
+    from ereader.assets.downloader import ensure_assets
+    ensure_assets()
+    
     splash.set_progress(30, "Đang kết nối cơ sở dữ liệu...")
     # Initialize Database
     app_dir = Path(config.library.path).expanduser()

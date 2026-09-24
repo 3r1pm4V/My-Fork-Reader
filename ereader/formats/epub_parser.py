@@ -66,7 +66,10 @@ class EpubParser(Document):
                                     try:
                                         # Copy each file, normalizing headers
                                         dst_zip.writestr(item.filename, src_zip.read(item.filename))
-                                    except:
+                                    except Exception:
+                                        logging.warning(
+                                            f"Repair: dropping unreadable member '{item.filename}' from {path.name}"
+                                        )
                                         continue
                         
                         # Try reading the repaired file
@@ -154,7 +157,8 @@ class EpubParser(Document):
         try:
             self._chapters = sorted(temp_chapters, key=get_sort_key)
             logging.info(f"Loaded {len(self._chapters)} chapters using Numerical/Alphabetical sorting.")
-        except:
+        except Exception:
+            logging.debug("Natural chapter sort failed, keeping manifest order.", exc_info=True)
             self._chapters = temp_chapters
             logging.info(f"Loaded {len(self._chapters)} chapters from raw Manifest order.")
             
@@ -193,6 +197,16 @@ class EpubParser(Document):
 
     def get_page(self, index: int) -> Page:
         if 0 <= index < len(self._chapters):
+            ch = self._chapters[index]
+            
+            # Handle virtual cover
+            if ch.get('is_virtual_cover'):
+                cover_data = self.get_cover()
+                import base64
+                b64 = base64.b64encode(cover_data).decode('utf-8')
+                html = f"<html><body style='margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh;'><img src='data:image/jpeg;base64,{b64}' style='max-width:100%;max-height:100%;object-fit:contain;' /></body></html>"
+                return Page(index=index, text="Cover Page", html=html)
+
             # Check cache first
             if self.db:
                 try:
@@ -296,5 +310,5 @@ class EpubParser(Document):
             import shutil
             try:
                 shutil.rmtree(str(self._temp_repair_dir))
-            except:
-                pass
+            except Exception:
+                logging.debug("Failed to remove temp repair dir", exc_info=True)

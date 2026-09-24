@@ -1,40 +1,103 @@
 import logging
 import psutil
 import os
+import json
+from pathlib import Path
+from string import Template
+
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser, QApplication,
-    QLabel, QPushButton, QSplitter, QProgressBar, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QProgressBar, QFrame, QMessageBox
 )
-from PyQt6.QtCore import pyqtSignal, Qt, QUrl, QObject, pyqtSlot, QPropertyAnimation, QEvent
+from PyQt6.QtCore import pyqtSignal, Qt, QUrl, QObject, pyqtSlot, QEvent
+from PyQt6.QtGui import QColor
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile
+from PyQt6.QtWebChannel import QWebChannel
 
 from ereader.formats.base import Document
 from ereader.ui.themes import theme_manager
-from ereader.ui.skeleton import SkeletonLoader
-from ereader.concurrency import main_thread_only
+
 
 class ReaderBridge(QObject):
-    """Bridge for JS -> Python communication only."""
-    textSelected = pyqtSignal(str)
-    pageCountChanged = pyqtSignal(int)
-    navRequested = pyqtSignal(str)
+    """
+    Bridge duy nhất cho giao tiếp JS -> Python qua QWebChannel.
+    Được đăng ký là 'pybridge' trên window.
+    """
+    relocated = pyqtSignal(float, str, int, int)  # fraction, cfi, current_page, total_pages
+    navRequested = pyqtSignal(str)                 # 'prev' | 'next'
+    bridgeReady = pyqtSignal()
+    bookReady = pyqtSignal()                       # foliate finished open() + init()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._active_channel = None
+
+    def set_active_channel(self, channel: QWebChannel | None):
+        """Lưu tham chiếu đến QWebChannel hiện tại."""
+        self._active_channel = channel
+
+    def cleanup(self, page=None):
+        """
+        Dọn dẹp và hủy hoàn toàn QWebChannel instance hiện tại:
+        - Deregister đối tượng khỏi channel
+        - Gỡ channel khỏi page của QWebEngineView
+        - Xóa và giải phóng tài nguyên của QWebChannel
+        Ngăn chặn rò rỉ bộ nhớ và tích tụ event listener khi re-initialize view.
+        """
+        if page:
+            try:
+                page.setWebChannel(None)
+            except Exception as e:
+                logging.debug(f"[ReaderBridge] Failed to detach web channel from page: {e}")
+
+        if self._active_channel is not None:
+            try:
+                self._active_channel.deregisterObject(self)
+            except Exception as e:
+                logging.debug(f"[ReaderBridge] Failed to deregister from channel: {e}")
+            try:
+                self._active_channel.deleteLater()
+            except Exception as e:
+                logging.debug(f"[ReaderBridge] Failed to delete channel: {e}")
+            self._active_channel = None
+
+        logging.info("[ReaderBridge] Cleanup completed for existing QWebChannel instance.")
 
     @pyqtSlot(str)
-    def onTextSelected(self, text: str):
-        self.textSelected.emit(text)
+    def onRelocate(self, detail_json: str):
+        try:
+            data = json.loads(detail_json)
+            fraction = float(data.get('fraction', 0.0))
+            cfi = str(data.get('cfi', ''))
+            
+            # Extract page / section info if provided
+            current_page = int(data.get('page', 0))
+            total_pages = int(data.get('totalPages', 0))
+            
+            self.relocated.emit(fraction, cfi, current_page, total_pages)
+        except Exception as e:
+            logging.error(f"[ReaderBridge] Error parsing relocate event: {e}")
 
-    @pyqtSlot(int)
-    def onPageCountReady(self, count: int):
-        self.pageCountChanged.emit(count)
-        
     @pyqtSlot(str)
     def onNavRequest(self, direction: str):
         self.navRequested.emit(direction)
 
+    @pyqtSlot()
+    def onReady(self):
+        logging.info("[ReaderBridge] JS bridge established and ready.")
+        self.bridgeReady.emit()
+
+    @pyqtSlot()
+    def onBookReady(self):
+        logging.info("[ReaderBridge] Book opened and positioned.")
+        self.bookReady.emit()
+
+
 class ReaderView(QWidget):
     back_requested = pyqtSignal()
-    page_changed = pyqtSignal(int, int) # current, total
+    page_changed = pyqtSignal(int, int)  # current, total
+    book_ready = pyqtSignal()            # book opened + initial position restored
 
     def __init__(self, config, db, parent=None):
         super().__init__(parent)
@@ -42,110 +105,36 @@ class ReaderView(QWidget):
         self.db = db
         self.document: Document | None = None
         self.book_id: int | None = None
-        
-        self.current_chapter_idx = 0
-        self.current_column_idx = 0
-        self.total_columns = 1
-        
+
+        # State tracking derived exclusively from foliate-js
+        self._current_fraction = 0.0
+        self._current_cfi = ""
+        self._current_page = 0
+        self._total_pages = 0
+        self._is_ready = False
+
+        # Khởi tạo bridge và đăng ký các slot duy nhất
         self._bridge = ReaderBridge()
-        self._bridge.textSelected.connect(self._on_text_selected)
-        self._bridge.pageCountChanged.connect(self._on_page_count_changed)
-        self._bridge.navRequested.connect(self._on_nav_requested)
-        
+        self._bridge.relocated.connect(self._on_bridge_relocated)
+        self._bridge.navRequested.connect(self._on_bridge_nav_requested)
+        self._bridge.bookReady.connect(self._on_bridge_book_ready)
+
         self._setup_ui()
-        theme_manager.theme_changed.connect(self._on_theme_changed)
-        
-        self.viewer.loadFinished.connect(self._on_load_finished)
-        self.viewer.installEventFilter(self)
+        self.viewer.page().installEventFilter(self)
 
-    def _on_nav_requested(self, direction: str):
-        if direction == 'next': self.next_page()
-        else: self.prev_page()
-
-    def eventFilter(self, source, event):
-        if event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Left:
-                self.prev_page()
-                return True
-            elif event.key() == Qt.Key.Key_Right:
-                self.next_page()
-                return True
-        elif event.type() == QEvent.Type.Wheel:
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                # Ctrl + Scroll to change font size
-                delta = event.angleDelta().y()
-                if delta > 0:
-                    self.config.reading.font_size = min(72, self.config.reading.font_size + 1)
-                else:
-                    self.config.reading.font_size = max(8, self.config.reading.font_size - 1)
-                self.config.save()
-                self.update_display()
-                return True
-        return super().eventFilter(source, event)
-
-    def set_document(self, doc: Document, book_id: int):
-        self.document = doc
-        self.book_id = book_id
-        self.title_label.setText(doc.title)
-        
-        # Load last progress
-        progress = self.db.get_latest_progress(book_id)
-        if progress:
-            self.current_chapter_idx = progress.get('page_number', 0)
-            logging.info(f"Loaded progress for book {book_id}: Chapter {self.current_chapter_idx}")
-        else:
-            self.current_chapter_idx = 0
-            logging.info(f"No progress found for book {book_id}, starting at Chapter 0")
-            
-        self.current_column_idx = 0
-        self.update_display()
-
-    def _on_page_count_changed(self, count: int):
-        self.total_columns = max(1, count)
-        # If we were waiting to scroll to a specific page (e.g. going back from next chapter)
-        if hasattr(self, '_pending_column_idx'):
-            self.current_column_idx = self._pending_column_idx
-            if self.current_column_idx < 0: 
-                self.current_column_idx = self.total_columns - 1
-            del self._pending_column_idx
-            
-        self._apply_scroll()
-        self._update_footer()
-
-    def _on_load_finished(self, ok):
-        if ok:
-            self.viewer.page().runJavaScript("""
-                (function() {
-                    const count = Math.ceil(document.documentElement.scrollWidth / window.innerWidth);
-                    pybridge.onPageCountReady(count);
-                })();
-            """)
-
-    def _apply_scroll(self):
-        js = f"window.scrollTo({self.current_column_idx} * window.innerWidth, 0);"
-        self.viewer.page().runJavaScript(js)
-
-    def _update_footer(self):
-        if not self.document: return
-        total_chapters = self.document.total_pages
-        
-        # Approximate progress
-        chapter_weight = 1.0 / total_chapters if total_chapters > 0 else 0
-        column_weight = chapter_weight / self.total_columns if self.total_columns > 0 else 0
-        
-        progress = (self.current_chapter_idx * chapter_weight) + (self.current_column_idx * column_weight)
-        percent = int(progress * 100)
-        
-        self.progress_bar.setValue(percent)
-        self.page_label.setText(f"Chapter {self.current_chapter_idx + 1}/{total_chapters} | Page {self.current_column_idx + 1}/{self.total_columns}")
-        self.page_changed.emit(self.current_chapter_idx + 1, total_chapters)
+    def get_progress_data(self) -> dict:
+        """Lấy tiến độ thực tế do foliate-js báo cáo."""
+        return {
+            "fraction": self._current_fraction,
+            "cfi": self._current_cfi
+        }
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        # Header
+        # Header bar
         self.header = QFrame()
         self.header.setObjectName("ReaderHeader")
         self.header.setFixedHeight(50)
@@ -155,270 +144,311 @@ class ReaderView(QWidget):
         h_layout.addWidget(self.btn_back)
         self.title_label = QLabel("Loading...")
         h_layout.addWidget(self.title_label, 1)
-        
-        self.btn_sidebar = QPushButton("☰")
-        self.btn_sidebar.setToolTip("Table of Contents")
-        self.btn_sidebar.clicked.connect(self._show_toc)
-        h_layout.addWidget(self.btn_sidebar)
-        
-        self.btn_bookmark = QPushButton("🔖")
-        self.btn_bookmark.setToolTip("Add Bookmark")
-        h_layout.addWidget(self.btn_bookmark)
-        
-        self.btn_tts = QPushButton("🔊")
-        self.btn_tts.setToolTip("Text to Speech")
-        h_layout.addWidget(self.btn_tts)
-        
         self.main_layout.addWidget(self.header)
 
-        # Viewer Container
+        # Container & WebEngineView
         self.container = QWidget()
         self.container_layout = QVBoxLayout(self.container)
         self.container_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # WebEngine Tuning
+
         profile = QWebEngineProfile("ereader-profile", self)
-        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
-        
         self.viewer = QWebEngineView(profile)
-        # Register Bridge
-        from PyQt6.QtWebChannel import QWebChannel
-        self.channel = QWebChannel()
-        self.channel.registerObject("pybridge", self._bridge)
-        self.viewer.page().setWebChannel(self.channel)
-        
+
+        # Quản lý vòng đời QWebChannel tập trung qua _bridge
+        self.channel = None
+
         settings = self.viewer.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
-        
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+
         self.container_layout.addWidget(self.viewer)
         self.main_layout.addWidget(self.container)
 
-        # Skeleton
-        self.skeleton = SkeletonLoader(self.container, mode="text")
-        self.skeleton.setVisible(False)
-
-        # Footer
+        # Footer bar
         self.footer = QFrame()
         self.footer.setObjectName("ReaderFooter")
         self.footer.setFixedHeight(50)
         f_layout = QHBoxLayout(self.footer)
-        
+
         self.btn_prev = QPushButton("«")
-        self.btn_prev.setToolTip("Previous Chapter")
         self.btn_prev.clicked.connect(self.prev_page)
         f_layout.addWidget(self.btn_prev)
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         f_layout.addWidget(self.progress_bar)
-        
-        self.page_label = QLabel("1/1")
+
+        self.page_label = QLabel("Loading...")
         f_layout.addWidget(self.page_label)
-        
+
         self.btn_next = QPushButton("»")
-        self.btn_next.setToolTip("Next Chapter")
         self.btn_next.clicked.connect(self.next_page)
         f_layout.addWidget(self.btn_next)
-        
+
         self.main_layout.addWidget(self.footer)
 
-    @main_thread_only
-    def _on_theme_changed(self, vars: dict):
-        js = f"""
-            if (document.documentElement) {{
-                document.documentElement.style.setProperty('--bg', '{vars['bg']}');
-                document.documentElement.style.setProperty('--fg', '{vars['fg']}');
-                document.documentElement.style.setProperty('--accent', '{vars['accent']}');
-            }}
-        """
-        self.viewer.page().runJavaScript(js)
-        self.skeleton.set_theme("light" if vars['bg'] == '#ffffff' else "dark")
+    def set_document(self, doc: Document, book_id: int):
+        """Khởi tạo tài liệu và cấu trúc trang web foliate-js."""
+        self.document = doc
+        self.book_id = book_id
+        self.title_label.setText(doc.title)
 
-    def _on_text_selected(self, text: str):
-        logging.info(f"Selected: {text}")
+        # 1. Dọn dẹp và chuẩn bị Channel trước khi load HTML
+        self._bridge.cleanup(page=self.viewer.page())
+        self.channel = QWebChannel(self.viewer.page())
+        self.channel.registerObject("pybridge", self._bridge)
+        self._bridge.set_active_channel(self.channel)
+        self.viewer.page().setWebChannel(self.channel)
 
-    def _show_toc(self):
-        if not self.document or not self.document.toc:
-            # Fallback to simple chapter list if TOC is empty
-            menu = QMenu(self)
-            for i in range(self.document.total_pages):
-                act = QAction(f"Chapter {i+1}", self)
-                act.triggered.connect(lambda ch, idx=i: self._jump_to_chapter(idx))
-                menu.addAction(act)
-            menu.exec(self.btn_sidebar.mapToGlobal(self.btn_sidebar.rect().bottomLeft()))
+        # 2. Xử lý đường dẫn
+        assets_dir = Path(__file__).parent.parent / "assets" / "foliate-js"
+        assets_url = Path(assets_dir).as_uri()
+        book_url = Path(doc.path).as_uri()
+        
+        last_progress = self.db.get_latest_progress(book_id) if self.db else None
+        last_cfi = last_progress.get('cfi', None) if last_progress else None
+        last_loc_js = json.dumps(last_cfi) if last_cfi else "null"
+
+        # ReaderView is reused between books: reset the state, otherwise
+        # get_progress_data() would still return the PREVIOUS book's position
+        # until the first relocate event arrives. Seed with the saved local
+        # position instead (0 for a book that was never opened).
+        self._is_ready = False
+        self._current_fraction = float(last_progress.get('percentage') or 0.0) if last_progress else 0.0
+        self._current_cfi = last_cfi or ""
+        self._current_page = 0
+        self._total_pages = 0
+
+        # 3. Tạo template HTML
+        # Sử dụng string.Template với cú pháp $variable để tránh xung đột với { } của JavaScript.
+        html_template = Template("""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        html, body { margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; }
+        #reader-view { width: 100%; height: 100%; display: block; }
+    </style>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+    <div id="debug-log" style="color:red; font-size:12px; position:absolute; top:0; left:0; z-index:1000; background: rgba(255,255,255,0.8);"></div>
+    <foliate-view id="reader-view"></foliate-view>
+    <script type="module">
+        import { View } from '$assets_url/view.js';
+
+        // --- Reader theme -------------------------------------------------
+        // The book lives inside foliate's own iframe, so the Qt stylesheet
+        // never reaches it: colours must be injected through renderer.setStyles().
+        // (No JS template literals here: string.Template would treat "dollar{" as a placeholder.)
+        window.__theme = $theme_js;
+        function buildThemeCss(t) {
+            return 'html { background-color: ' + t.bg + ' !important; color: ' + t.fg + ' !important; }\\n'
+                 + 'body { background-color: transparent !important; color: ' + t.fg + ' !important; }\\n'
+                 + 'body *:not(a):not(img):not(svg):not(image) { color: inherit !important; background-color: transparent !important; }\\n'
+                 + 'a:link, a:visited { color: ' + t.accent + ' !important; }\\n';
+        }
+        window.applyReaderTheme = function(t) {
+            window.__theme = t;
+            document.documentElement.style.background = t.bg;
+            document.body.style.background = t.bg;
+            const v = document.getElementById('reader-view');
+            if (v && v.renderer && typeof v.renderer.setStyles === 'function') {
+                v.renderer.setStyles(buildThemeCss(t));
+            }
+        };
+        
+        function log(msg) { console.log(msg); document.getElementById('debug-log').innerHTML += msg + '<br>'; }
+        window.onerror = function(msg, url, line) { log('Error: ' + msg + ' at ' + line); };
+        
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            log('Channel connected');
+            window.pybridge = channel.objects.pybridge;
+            window.pybridge.onReady();
+            const view = document.getElementById('reader-view');
+            
+            view.addEventListener('relocate', (e) => {
+                const d = e.detail || {};
+                window.pybridge.onRelocate(JSON.stringify({ 
+                    fraction: d.fraction || 0, 
+                    cfi: d.cfi || '',
+                    page: d.pageItem?.index || 0,
+                    totalPages: d.pageItem?.total || 0
+                }));
+            });
+            
+            view.open('$book_url')
+                .then(function() { 
+                    log('Book opened');
+                    window.applyReaderTheme(window.__theme);
+                    return view.init({ lastLocation: $last_loc_js, showTextStart: true }); 
+                })
+                .then(function() { log('Initialized'); window.pybridge.onBookReady(); })
+                .catch(function(err) { log('Err: ' + err.message); });
+        });
+    </script>
+</body>
+</html>""")
+        
+        theme = self._theme_payload()
+        # Avoid a white flash behind the page while foliate is still loading
+        self.viewer.page().setBackgroundColor(QColor(theme["bg"]))
+
+        html_content = html_template.safe_substitute(
+            assets_url=assets_url,
+            book_url=book_url,
+            last_loc_js=last_loc_js,
+            theme_js=json.dumps(theme)
+        )
+        
+        # Sử dụng baseUrl là thư mục chứa assets để import có thể giải quyết đường dẫn tương đối
+        self.viewer.setHtml(html_content, QUrl(assets_url + "/"))
+
+    @pyqtSlot(float, str, int, int)
+    def _on_bridge_relocated(self, fraction: float, cfi: str, current_page: int, total_pages: int):
+        """Xử lý sự kiện định vị trang duy nhất được gửi từ foliate-js."""
+        self._current_fraction = fraction
+        self._current_cfi = cfi
+        self._current_page = current_page
+        self._total_pages = total_pages
+
+        self._update_progress_ui(fraction, cfi)
+
+        # Lưu lại tiến độ vào Database
+        if self.book_id and self.db:
+            try:
+                self.db.update_progress(self.book_id, fraction, cfi=cfi, page_num=current_page)
+            except Exception as e:
+                logging.error(f"[ReaderView] Failed to save progress to DB: {e}")
+
+        # Relocate events fired while foliate is still opening/restoring the last
+        # position must not reach the sync layer (they would overwrite the
+        # remote progress with a stale position).
+        if not self._is_ready:
             return
 
-        menu = QMenu(self)
-        for item in self.document.toc:
-            # Normalize TOC position: remove fragment (#...) and ensure correct path separators
-            pos = item.position.split('#')[0].replace('\\', '/')
-            
-            act = QAction(f"{'  ' * item.level}{item.title}", self)
-            
-            # Find chapter index by matching normalized position
-            target_idx = -1
-            for i in range(self.document.total_pages):
-                ch = self.document._chapters[i]
-                ch_name = ch['name'].replace('\\', '/')
-                if pos == ch_name or ch_name.endswith('/' + pos) or pos.endswith('/' + ch_name):
-                    target_idx = i
-                    break
-            
-            if target_idx == -1: continue # Skip items we can't map to a chapter
-            
-            act.triggered.connect(lambda ch, idx=target_idx: self._jump_to_chapter(idx))
-            menu.addAction(act)
-        
-        if menu.isEmpty():
-            # If we filtered everything out, show simple chapters
-            for i in range(self.document.total_pages):
-                act = QAction(f"Chapter {i+1}", self)
-                act.triggered.connect(lambda ch, idx=i: self._jump_to_chapter(idx))
-                menu.addAction(act)
-        
-        menu.exec(self.btn_sidebar.mapToGlobal(self.btn_sidebar.rect().bottomLeft()))
+        # Phát tín hiệu đồng bộ cho MainWindow
+        total_rep = total_pages if total_pages > 0 else (self.document.total_pages if self.document else 1)
+        curr_rep = current_page if current_page > 0 else int(fraction * total_rep) + 1
+        self.page_changed.emit(curr_rep, total_rep)
 
-    def _jump_to_chapter(self, idx: int):
-        self.current_chapter_idx = idx
-        self.current_column_idx = 0
-        self.update_display()
+    def _on_bridge_book_ready(self):
+        self._is_ready = True
+        self.book_ready.emit()
 
-    def update_display(self):
-        if not self.document: return
-        total_chapters = self.document.total_pages
-        if total_chapters > 0:
-            page = self.document.get_page(self.current_chapter_idx)
-            vars = theme_manager.get_theme_variables(self.config.reading.theme)
-            
-            style = f"""
-            <style>
-                :root {{
-                    --bg: {vars['bg']};
-                    --fg: {vars['fg']};
-                    --accent: {vars['accent']};
-                }}
-                body {{
-                    background-color: var(--bg);
-                    color: var(--fg);
-                    font-family: '{self.config.reading.font_family}', "Segoe UI", "Georgia", serif;
-                    line-height: {self.config.reading.line_height};
-                    font-size: {self.config.reading.font_size}px;
-                    
-                    margin: 0;
-                    padding: 0;
-                    width: 100vw;
-                    height: 100vh;
-                    overflow: hidden;
-                    
-                    /* Single column layout */
-                    column-width: 100vw;
-                    column-gap: 0;
-                    column-fill: auto;
-                }}
-                .content-wrapper {{
-                    padding: 60px 15%;
-                    box-sizing: border-box;
-                    min-height: 100vh;
-                    cursor: pointer;
-                }}
-                .content-wrapper.image-page {{
-                    padding: 0;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                }}
-                img, svg {{ 
-                    max-width: 100%; 
-                    max-height: 85vh; 
-                    height: auto; 
-                    display: block; 
-                    margin: 20px auto; 
-                    object-fit: contain;
-                    border-radius: 4px;
-                }}
-                p {{ 
-                    margin-bottom: 1.4em; 
-                    text-align: justify; 
-                    hyphens: auto;
-                }}
-                h1, h2, h3 {{ 
-                    break-before: column; 
-                    margin-top: 1.2em; 
-                    margin-bottom: 0.8em;
-                    color: var(--fg);
-                    font-weight: 600;
-                    line-height: 1.3;
-                }}
-            </style>
-            <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-            <script>
-                new QWebChannel(qt.webChannelTransport, function (channel) {{
-                    window.pybridge = channel.objects.pybridge;
-                }});
-                
-                document.addEventListener('click', function(e) {{
-                    const width = window.innerWidth;
-                    if (e.clientX < width / 3) {{
-                        pybridge.onNavRequest('prev');
-                    }} else if (e.clientX > width * 2 / 3) {{
-                        pybridge.onNavRequest('next');
-                    }}
-                }});
-            </script>
-            """
-            content = page.html or page.text
-            if not content or content.strip() == "":
-                content = f"<div style='text-align: center; margin-top: 40vh; color: var(--fg); font-style: italic;'>[ This chapter appears to be empty or contains only non-text elements ]</div>"
-            
-            # Detect if this is likely a cover page (mostly just an image)
-            is_image_page = "img" in content.lower() and len(page.text.strip()) < 50
-            wrapper_class = "content-wrapper image-page" if is_image_page else "content-wrapper"
-                
-            html = f"<html><head>{style}</head><body><div class='{wrapper_class}'>{content}</div></body></html>"
-            self.viewer.setHtml(html)
+    def _update_progress_ui(self, fraction: float, cfi: str):
+        pct = max(0, min(100, int(fraction * 100)))
+        self.progress_bar.setValue(pct)
+        self.page_label.setText(f"{pct}%")
+
+    def _on_bridge_nav_requested(self, direction: str):
+        if direction == 'next':
+            self.next_page()
+        elif direction == 'prev':
+            self.prev_page()
 
     def next_page(self):
-        if self.current_column_idx < self.total_columns - 1:
-            self.current_column_idx += 1
-            self._apply_scroll()
-            self._update_footer()
-        elif self.document and self.current_chapter_idx < self.document.total_pages - 1:
-            self.current_chapter_idx += 1
-            self.current_column_idx = 0
-            self.update_display()
+        js = """
+        (() => {
+            const view = document.getElementById('reader-view');
+            if (view && typeof view.next === 'function') {
+                view.next();
+            }
+        })();
+        """
+        self.viewer.page().runJavaScript(js)
 
     def prev_page(self):
-        if self.current_column_idx > 0:
-            self.current_column_idx -= 1
-            self._apply_scroll()
-            self._update_footer()
-        elif self.current_chapter_idx > 0:
-            self.current_chapter_idx -= 1
-            # We need to scroll to the LAST page of the previous chapter
-            self._pending_column_idx = -1 
-            self.update_display()
+        js = """
+        (() => {
+            const view = document.getElementById('reader-view');
+            if (view && typeof view.prev === 'function') {
+                view.prev();
+            }
+        })();
+        """
+        self.viewer.page().runJavaScript(js)
+
+    def go_to_percentage(self, percentage: float):
+        """Chuyển đến phần trăm tài liệu thông qua foliate-js API."""
+        # State is updated by the 'relocate' event once the jump really happened.
+        # Sử dụng .replace để tránh xung đột với {} trong JS
+        js = """
+        (() => {
+            const view = document.getElementById('reader-view');
+            if (view && typeof view.goToFraction === 'function') {
+                Promise.resolve(view.goToFraction(__PERCENTAGE__))
+                    .catch(e => console.error('goToFraction failed', e));
+            }
+        })();
+        """.replace('__PERCENTAGE__', str(percentage))
+        self.viewer.page().runJavaScript(js)
+
+    def go_to_cfi(self, cfi: str):
+        """Chuyển đến CFI cụ thể thông qua foliate-js API."""
+        escaped_cfi = json.dumps(cfi)
+        # Sử dụng .replace để tránh xung đột với {} trong JS
+        js = """
+        (() => {
+            const view = document.getElementById('reader-view');
+            if (view && typeof view.goTo === 'function') {
+                view.goTo(__CFI__);
+            }
+        })();
+        """.replace('__CFI__', escaped_cfi)
+        self.viewer.page().runJavaScript(js)
+
+    def _theme_payload(self) -> dict:
+        v = theme_manager.get_theme_variables(self.config.reading.theme)
+        return {"bg": v["bg"], "fg": v["fg"], "accent": v["accent"]}
+
+    def update_display(self):
+        """Được MainWindow gọi khi đổi theme hoặc settings: áp theme vào nội dung sách."""
+        theme = self._theme_payload()
+        page = self.viewer.page()
+        page.setBackgroundColor(QColor(theme["bg"]))
+        page.runJavaScript(
+            "window.applyReaderTheme && window.applyReaderTheme(__THEME__);"
+            .replace("__THEME__", json.dumps(theme))
+        )
 
     def save_progress(self):
-        if self.document and self.book_id:
-            total = self.document.total_pages
-            percentage = (self.current_chapter_idx) / total if total > 0 else 0
-            self.db.update_progress(
-                self.book_id,
-                percentage,
-                cfi="", # Not implemented yet
-                page_num=self.current_chapter_idx
-            )
+        """Lưu lại tiến độ hiện tại."""
+        if self.book_id and self.db:
+            try:
+                self.db.update_progress(
+                    self.book_id,
+                    self._current_fraction,
+                    cfi=self._current_cfi,
+                    page_num=self._current_page
+                )
+            except Exception as e:
+                logging.error(f"[ReaderView] Error in save_progress: {e}")
 
     def end_session(self):
         self.save_progress()
         logging.info(f"Ending reading session for book {self.book_id}")
 
     def cleanup(self):
-        """Releases WebEngine resources."""
+        """Giải phóng tài nguyên WebEngine và WebChannel khi đóng sách."""
+        self._bridge.cleanup(page=self.viewer.page())
+        self.channel = None
         self.viewer.setHtml("")
         self.viewer.page().profile().clearHttpCache()
         process = psutil.Process(os.getpid())
         logging.info(f"RAM after cleanup: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+
+    def eventFilter(self, source, event):
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Left:
+                self.prev_page()
+                return True
+            elif event.key() == Qt.Key.Key_Right:
+                self.next_page()
+                return True
+        return super().eventFilter(source, event)
+
 
 __all__ = ["ReaderView"]

@@ -21,26 +21,22 @@ def get_file_hash(path: Path) -> str:
         return hashlib.sha256(path.name.encode()).hexdigest()
     return sha256.hexdigest()
 
-def partial_md5(path: Path, chunk_size: int = 1024) -> str:
-    """
-    KOReader-compatible partial MD5 of file.
-    Reads 1KB chunks at exponentially increasing offsets.
-    """
-    md5 = hashlib.md5()
+def partial_md5(path: Path) -> str:
+    """KOReader-compatible document ID using the correct "Binary" matching method offset sequence."""
     try:
-        file_size = path.stat().st_size
-        offset = chunk_size
+        digest = hashlib.md5()
         with open(path, "rb") as f:
-            while offset < file_size:
+            # Correct KOReader offset sequence as derived from util.lua
+            offsets = [0, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824]
+            for offset in offsets:
                 f.seek(offset)
-                chunk = f.read(chunk_size)
-                if not chunk:
+                sample = f.read(1024)
+                if not sample:
                     break
-                md5.update(chunk)
-                offset *= 2
+                digest.update(sample)
+        return digest.hexdigest()
     except Exception as e:
-        logging.error(f"Partial MD5 failed for {path}: {e}")
-        return hashlib.md5(path.name.encode()).hexdigest()
-    return md5.hexdigest()
+        logging.error(f"Partial MD5 calculation failed for {path}: {e}")
+        return hashlib.md5(path.name.encode("utf-8")).hexdigest()
 
 __all__ = ["get_file_hash", "partial_md5"]
